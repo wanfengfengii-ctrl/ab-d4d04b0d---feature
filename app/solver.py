@@ -6,6 +6,10 @@
 (上候选, 下候选) 有序对，转移时一次性检查两条界面的全部约束，
 因此不会出现"先追一条界面、再为另一条补点"的伪轨迹。
 
+启用 phase_continuity 后，候选回波还带有相位（positive/negative）：
+普通边界两侧两条界面须分别保持相位，声明的极性反转边界两侧须分别
+反转相位。相位只作为可行性硬约束，不参与裁决。
+
 最优性按词典序：
   1. 置信度总和最大
   2. 两条界面最大二阶差最小
@@ -21,6 +25,12 @@ MAX_COLS = 24
 MIN_CANDIDATES = 3
 MAX_CANDIDATES = 8
 
+# 一次请求至多声明两个互异的极性反转边界。
+MAX_POLARITY_FLIPS = 2
+
+PHASE_SIGN = {"positive": 1, "negative": -1}
+PHASE_NAME = {1: "positive", -1: "negative"}
+
 
 class ValidationError(ValueError):
     """请求数据不满足接口契约。"""
@@ -32,7 +42,42 @@ def _as_int(value, name):
     return value
 
 
-def _parse_column(raw, index):
+def _parse_phase_continuity(raw, n_cols):
+    """校验 phase_continuity 字段，返回反转边界集合（省略时为 None）。
+
+    边界 i 表示第 i 列与第 i+1 列之间，合法取值 0 <= i <= n_cols-2。
+    """
+    if raw is None:  # 字段缺省或显式 null：沿用无相位语义
+        return None
+    if not isinstance(raw, dict):
+        raise ValidationError("phase_continuity 必须是对象")
+
+    flips_raw = raw.get("polarity_flips", [])
+    if not isinstance(flips_raw, list):
+        raise ValidationError("phase_continuity.polarity_flips 必须是数组")
+    if len(flips_raw) > MAX_POLARITY_FLIPS:
+        raise ValidationError(
+            f"phase_continuity.polarity_flips 至多声明 {MAX_POLARITY_FLIPS} 个边界"
+        )
+
+    max_boundary = n_cols - 2
+    flips = []
+    for k, item in enumerate(flips_raw):
+        name = f"phase_continuity.polarity_flips[{k}]"
+        boundary = _as_int(item, name)
+        if boundary < 0 or boundary > max_boundary:
+            raise ValidationError(
+                f"{name} 越界：边界编号须在 0~{max_boundary} 之间"
+            )
+        if boundary in flips:
+            raise ValidationError(
+                f"phase_continuity.polarity_flips 存在重复边界: {boundary}"
+            )
+        flips.append(boundary)
+    return frozenset(flips)
+
+
+def _parse_column(raw, index, phase_enabled=False):
     """解析并校验单列数据，返回按深度排序的候选列表。"""
     if not isinstance(raw, dict):
         raise ValidationError(f"columns[{index}] 必须是对象")
@@ -69,7 +114,16 @@ def _parse_column(raw, index):
             raise ValidationError(
                 f"columns[{index}].candidates[{j}].confidence 必须是正整数"
             )
-        cands.append({"id": cid, "depth": depth, "confidence": conf})
+        cand = {"id": cid, "depth": depth, "confidence": conf}
+        if phase_enabled:
+            raw_phase = item.get("phase")
+            if raw_phase not in PHASE_SIGN:
+                raise ValidationError(
+                    f"columns[{index}].candidates[{j}].phase 缺失或非法："
+                    "启用 phase_continuity 时必须为 positive 或 negative"
+                )
+            cand["phase"] = PHASE_SIGN[raw_phase]
+        cands.append(cand)
 
     # 深度相同的候选不影响正确性（它们之间无法配成严格分离对），
     # 排序仅用于输出稳定与编号决胜。
@@ -80,11 +134,6 @@ def _parse_column(raw, index):
 def _parse_limits(payload):
     if not isinstance(payload, dict):
         raise ValidationError("limits 必须是对象")
-
-    def get(name):
-        if name not in payload:
-            raise ValidationError(f"limits.{name} 缺失")
-        return _as_int(payload[name], f"limits.{name}")
 
     def get(name):
         if name not in payload:
@@ -126,7 +175,10 @@ def _parse_limits(payload):
 
 
 def parse_request(payload):
-    """校验请求体，返回 (columns, limits)。"""
+    """校验请求体，返回 (columns, limits, flips)。
+
+    flips 为 None 表示未启用相位连续性；否则为极性反转边界集合。
+    """
     if not isinstance(payload, dict):
         raise ValidationError("请求体必须是 JSON 对象")
     cols_raw = payload.get("columns")
@@ -135,9 +187,13 @@ def parse_request(payload):
     if not (MIN_COLS <= len(cols_raw) <= MAX_COLS):
         raise ValidationError(f"columns 数量必须在 {MIN_COLS}~{MAX_COLS} 之间")
 
-    columns = [_parse_column(col, i) for i, col in enumerate(cols_raw)]
+    flips = _parse_phase_continuity(payload.get("phase_continuity"), len(cols_raw))
+    columns = [
+        _parse_column(col, i, phase_enabled=flips is not None)
+        for i, col in enumerate(cols_raw)
+    ]
     limits = _parse_limits(payload.get("limits"))
-    return columns, limits
+    return columns, limits, flips
 
 
 def _build_states(column, limits):
@@ -169,11 +225,14 @@ def _better(candidate, current):
     return cpath < bpath
 
 
-def _run_dp(columns, col_states, limits, cap, collect_costs=False):
+def _run_dp(columns, col_states, limits, cap, flips=None, collect_costs=False):
     """在"每条连续三列的二阶差 <= cap"硬约束下做分层状态 DP。
 
     固定 cap 后只剩置信度（最大化）与行程（最小化）两个可加目标，
     每个 (上一列状态, 当前列状态) 只保留唯一词典序最优前缀。
+
+    flips 非 None 时额外施加相位连续性：边界 ci-1 位于 flips 中则
+    上下界面跨边界都必须反转相位，否则都必须保持相位。
 
     collect_costs=True 时顺带收集全部局部可行三元组产生的二阶差值
     （用于二分全局最优 cap 的候选集合）。
@@ -211,6 +270,11 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
             def predecessors_of(pr):
                 return by_prev_rank.get(pr, ())
 
+        # 本跨段（第 ci-1 列与第 ci 列之间）要求的相位关系。
+        phase_relation = None
+        if flips is not None:
+            phase_relation = -1 if (ci - 1) in flips else 1
+
         for rnk, (ui, li) in enumerate(cur_states):
             up, lo = cur_col[ui], cur_col[li]
             thickness = lo["depth"] - up["depth"]
@@ -224,6 +288,11 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
                     continue
                 pthick = plo["depth"] - pup["depth"]
                 if abs(thickness - pthick) > limits["max_thickness_change"]:
+                    continue
+                if phase_relation is not None and (
+                    up["phase"] != phase_relation * pup["phase"]
+                    or lo["phase"] != phase_relation * plo["phase"]
+                ):
                     continue
 
                 records = predecessors_of(pr)
@@ -270,7 +339,7 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
     return best is not None, best, costs
 
 
-def solve(columns, limits):
+def solve(columns, limits, flips=None):
     """联合追踪求解。
 
     策略（严格按裁决词典序）：
@@ -279,6 +348,8 @@ def solve(columns, limits):
       2. 对候选二阶差值二分：求最小的 K，使"在硬约束 K 下仍能达到
          置信度 C*"（可达置信度对 K 单调）；
       3. 在 K 下做最终（置信度, 行程, 编号路径）词典序 DP。
+
+    flips 非 None 时相位连续性在全部 DP 中作为硬约束施加。
     """
     col_states = [_build_states(col, limits) for col in columns]
     if any(not states for states in col_states):
@@ -286,7 +357,7 @@ def solve(columns, limits):
 
     cap_limit = limits.get("max_second_diff")
     feasible, best_l, costs = _run_dp(
-        columns, col_states, limits, cap_limit, collect_costs=True
+        columns, col_states, limits, cap_limit, flips, collect_costs=True
     )
     if not feasible:
         return {"feasible": False}
@@ -296,7 +367,7 @@ def solve(columns, limits):
     candidates = sorted(costs | {0})
 
     def reaches_max_confidence(cap):
-        ok, best, _ = _run_dp(columns, col_states, limits, cap)
+        ok, best, _ = _run_dp(columns, col_states, limits, cap, flips)
         return ok and -best[0][0] == max_confidence
 
     lo_i, hi_i = 0, len(candidates) - 1
@@ -308,15 +379,16 @@ def solve(columns, limits):
             lo_i = mid + 1
     optimal_cap = candidates[lo_i]
 
-    _, best, _ = _run_dp(columns, col_states, limits, optimal_cap)
+    _, best, _ = _run_dp(columns, col_states, limits, optimal_cap, flips)
     (neg_conf, total_travel), ranks = best
     path = [col_states[ci][rank] for ci, rank in enumerate(ranks)]
     return _build_result(
-        columns, path, -neg_conf, optimal_cap, total_travel
+        columns, path, -neg_conf, optimal_cap, total_travel, flips
     )
 
 
-def _build_result(columns, path, total_conf, max_second_diff, total_travel):
+def _build_result(columns, path, total_conf, max_second_diff, total_travel,
+                  flips=None):
     upper, lower, thicknesses = [], [], []
     u_slopes, l_slopes = [], []
     u_seconds, l_seconds = [], []
@@ -349,25 +421,44 @@ def _build_result(columns, path, total_conf, max_second_diff, total_travel):
                 {"columns": [ci - 2, ci - 1, ci], "second_diff": lo["depth"] - 2 * pl + ppl}
             )
 
-    return {
+    result = {
         "feasible": True,
         "upper_horizon": upper,
         "lower_horizon": lower,
         "thicknesses": thicknesses,
         "slopes": {"upper": u_slopes, "lower": l_slopes},
         "second_diffs": {"upper": u_seconds, "lower": l_seconds},
-        "verdict": {
-            "total_confidence": total_conf,
-            "max_second_diff": max_second_diff,
-            "total_travel": total_travel,
-        },
     }
+    if flips is not None:
+        # 逐列相位直接取自入选候选；实际反转边界由所选轨迹推导，
+        # 可行时必然恰为声明边界集合。
+        phases = {"upper": [], "lower": []}
+        actual_flips = []
+        for ci, (ui, li) in enumerate(path):
+            phases["upper"].append(
+                {"column": ci, "phase": PHASE_NAME[columns[ci][ui]["phase"]]}
+            )
+            phases["lower"].append(
+                {"column": ci, "phase": PHASE_NAME[columns[ci][li]["phase"]]}
+            )
+            if ci >= 1:
+                pui, pli = path[ci - 1]
+                if columns[ci][ui]["phase"] != columns[ci - 1][pui]["phase"]:
+                    actual_flips.append(ci - 1)
+        result["phases"] = phases
+        result["polarity_flips"] = actual_flips
+    result["verdict"] = {
+        "total_confidence": total_conf,
+        "max_second_diff": max_second_diff,
+        "total_travel": total_travel,
+    }
+    return result
 
 
 def trace(payload):
     """供 HTTP 层调用的入口：校验 -> 求解。"""
-    columns, limits = parse_request(payload)
-    result = solve(columns, limits)
+    columns, limits, flips = parse_request(payload)
+    result = solve(columns, limits, flips)
     if not result["feasible"]:
         result["status"] = "no_solution"
         result["message"] = "不存在满足全部约束的上下界面联合拾取组合"
