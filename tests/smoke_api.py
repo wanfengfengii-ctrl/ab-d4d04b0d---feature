@@ -38,6 +38,13 @@ def col(cands):
     ]}
 
 
+def colp(cands):
+    return {"candidates": [
+        {"id": cid, "depth": d, "confidence": c, "phase": p}
+        for cid, d, c, p in cands
+    ]}
+
+
 LIMITS = {
     "min_thickness": 6,
     "max_thickness": 10,
@@ -123,6 +130,100 @@ def main():
     check("不伪造任何局部轨迹",
           "upper_horizon" not in payload and "lower_horizon" not in payload,
           str(payload))
+
+    # 4b. 相位连续性：高置信负相候选仅出现在后 4 列。
+    phase_columns = []
+    for i in range(8):
+        cands = [
+            ("G", 10 + i, 5, "positive"),
+            ("g", 18 + i, 5, "positive"),
+            ("X", 0, 9, "positive"),
+            ("Y", 30, 9, "positive"),
+        ]
+        if i >= 4:
+            cands += [("P", 10 + i, 9, "negative"),
+                      ("Q", 18 + i, 9, "negative")]
+        phase_columns.append(colp(cands))
+
+    # 不声明反转：跳相高置信候选被拒绝，相位连续的 G/g 胜出。
+    status, p_no = request(
+        "POST", "/api/horizons/trace",
+        {"columns": phase_columns, "limits": LIMITS,
+         "phase_continuity": {"polarity_flips": []}})
+    check("相位保相用例返回 200", status == 200, str(p_no))
+    check("保相请求 feasible=true", p_no.get("feasible") is True)
+    check("跳相高置信伪反射被否决",
+          [p["id"] for p in p_no.get("upper_horizon", [])] == ["G"] * 8
+          and [p["id"] for p in p_no.get("lower_horizon", [])] == ["g"] * 8,
+          str(p_no.get("upper_horizon")))
+    check("保相用例逐列相位全 positive",
+          [p["phase"] for p in p_no.get("phases", {}).get("upper", [])]
+          == ["positive"] * 8
+          and [p["phase"] for p in p_no.get("phases", {}).get("lower", [])]
+          == ["positive"] * 8)
+    check("保相用例实际反转边界为空", p_no.get("polarity_flips") == [])
+    check("未启用请求不返回相位字段",
+          payload.get("phases") is None and payload.get("polarity_flips") is None)
+
+    # 声明边界 3 反转：前 G/g 后 P/Q 的高置信轨迹合法并胜出。
+    status, p_flip = request(
+        "POST", "/api/horizons/trace",
+        {"columns": phase_columns, "limits": LIMITS,
+         "phase_continuity": {"polarity_flips": [3]}})
+    check("反转声明用例返回 200", status == 200, str(p_flip))
+    check("反转声明 feasible=true", p_flip.get("feasible") is True)
+    check("声明反转后高置信轨迹胜出",
+          [p["id"] for p in p_flip.get("upper_horizon", [])]
+          == ["G"] * 4 + ["P"] * 4
+          and [p["id"] for p in p_flip.get("lower_horizon", [])]
+          == ["g"] * 4 + ["Q"] * 4,
+          str(p_flip.get("upper_horizon")))
+    check("逐列相位回传为 ++++----",
+          [p["phase"] for p in p_flip.get("phases", {}).get("upper", [])]
+          == ["positive"] * 4 + ["negative"] * 4
+          and [p["phase"] for p in p_flip.get("phases", {}).get("lower", [])]
+          == ["positive"] * 4 + ["negative"] * 4)
+    check("实际反转边界回传 [3]", p_flip.get("polarity_flips") == [3])
+
+    # 相位规则导致不可行：唯一几何可行轨迹在边界 3 跳相但未声明反转。
+    phase_dead = []
+    for i in range(8):
+        ph = "negative" if i >= 4 else "positive"
+        phase_dead.append(colp([
+            ("U", 10 + i, 5, ph), ("L", 18 + i, 5, ph),
+            ("X", 0, 9, "positive"), ("Y", 30, 9, "positive"),
+        ]))
+    status, p_dead = request(
+        "POST", "/api/horizons/trace",
+        {"columns": phase_dead, "limits": LIMITS,
+         "phase_continuity": {"polarity_flips": []}})
+    check("相位不可行返回 200", status == 200, str(p_dead))
+    check("相位不可行 feasible=false", p_dead.get("feasible") is False)
+    check("相位不可行 no_solution", p_dead.get("status") == "no_solution")
+    check("相位不可行不泄露局部轨迹/相位",
+          "upper_horizon" not in p_dead and "phases" not in p_dead
+          and "polarity_flips" not in p_dead, str(p_dead))
+
+    # 非法边界与缺失相位按字段拒绝（422）。
+    bad_flip = {"columns": phase_columns, "limits": LIMITS,
+                "phase_continuity": {"polarity_flips": [7]}}
+    status, p_bad = request("POST", "/api/horizons/trace", bad_flip)
+    check("越界反转边界返回 422", status == 422, str(p_bad))
+
+    dup_flip = {"columns": phase_columns, "limits": LIMITS,
+                "phase_continuity": {"polarity_flips": [3, 3]}}
+    status, p_dup = request("POST", "/api/horizons/trace", dup_flip)
+    check("重复反转边界返回 422", status == 422, str(p_dup))
+
+    too_many = {"columns": phase_columns, "limits": LIMITS,
+                "phase_continuity": {"polarity_flips": [1, 2, 3]}}
+    status, p_many = request("POST", "/api/horizons/trace", too_many)
+    check("超过两个反转边界返回 422", status == 422, str(p_many))
+
+    missing_phase = {"columns": columns, "limits": LIMITS,
+                     "phase_continuity": {"polarity_flips": []}}
+    status, p_miss = request("POST", "/api/horizons/trace", missing_phase)
+    check("启用但候选缺相位返回 422", status == 422, str(p_miss))
 
     # 5. 入参校验：列数不足。
     status, payload = request("POST", "/api/horizons/trace",

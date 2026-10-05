@@ -36,6 +36,20 @@ def col(cands):
     ]}
 
 
+def colp(cands):
+    """cands: [(id, depth, confidence, phase), ...]"""
+    return {"candidates": [
+        {"id": cid, "depth": d, "confidence": c, "phase": p}
+        for cid, d, c, p in cands
+    ]}
+
+
+def phase_body(columns, flips=None, limits=None):
+    body = payload(columns, limits)
+    body["phase_continuity"] = {"polarity_flips": flips or []}
+    return body
+
+
 def payload(columns, limits=None):
     return {"columns": columns, "limits": limits or DEFAULT_LIMITS}
 
@@ -64,7 +78,7 @@ def chosen_pairs(columns, result):
     return pairs
 
 
-def validate_result(columns, limits, result):
+def validate_result(columns, limits, result, phase_cfg=None):
     """对成功结果做完整约束复核，返回裁决三元组。"""
     n_cols = len(columns)
     assert result["feasible"] is True
@@ -118,6 +132,30 @@ def validate_result(columns, limits, result):
     assert verdict["total_confidence"] == total_conf
     assert verdict["max_second_diff"] == max_sec
     assert verdict["total_travel"] == travel
+
+    if phase_cfg is not None:
+        flips = set(phase_cfg["flips"])
+        up_phase = [columns[i][pairs[i][0]]["phase"] for i in range(n_cols)]
+        lo_phase = [columns[i][pairs[i][1]]["phase"] for i in range(n_cols)]
+        assert [p["phase"] for p in result["phases"]["upper"]] == up_phase
+        assert [p["phase"] for p in result["phases"]["lower"]] == lo_phase
+        assert [p["column"] for p in result["phases"]["upper"]] == \
+            list(range(n_cols))
+        actual = set(result["polarity_flips"])
+        # 声明反转边界必反转，普通边界必保相；实际反转边界集合须一致。
+        for i in range(1, n_cols):
+            boundary = i - 1
+            up_changed = up_phase[i] != up_phase[i - 1]
+            lo_changed = lo_phase[i] != lo_phase[i - 1]
+            if boundary in flips:
+                assert up_changed and lo_changed
+            else:
+                assert not up_changed and not lo_changed
+            assert (boundary in actual) == up_changed
+        assert actual <= flips  # 未声明的边界绝不能反转
+    else:
+        assert "phases" not in result and "polarity_flips" not in result
+
     return total_conf, max_sec, travel
 
 
@@ -125,7 +163,7 @@ class ScenarioTests(unittest.TestCase):
     def test_smooth_joint_trace_beats_greedy_strongest(self):
         # 逐列最强回波是深度 0/30 的干扰点（成对置信度 18），
         # 但任何跨列延续都违反坡差；联合追踪必须给出平滑双界面。
-        columns, limits = parse_request(payload(smooth_columns()))
+        columns, limits, _ = parse_request(payload(smooth_columns()))
         result = trace(payload(smooth_columns()))
         self.assertEqual(result["status"], "ok")
         validate_result(columns, limits, result)
@@ -157,7 +195,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertNotIn("upper_horizon", result)  # 不伪造局部轨迹
 
         limits["max_second_diff"] = 3
-        columns, plimits = parse_request(payload(zigzag, limits))
+        columns, plimits, _ = parse_request(payload(zigzag, limits))
         ok = trace(payload(zigzag, limits))
         self.assertTrue(ok["feasible"])
         validate_result(columns, plimits, ok)
@@ -173,7 +211,7 @@ class ScenarioTests(unittest.TestCase):
     def test_optional_second_diff_still_adjudicated(self):
         # 省略 max_second_diff：无二阶差硬约束，但裁决仍在最大置信度
         # 前提下最小化最大二阶差。
-        columns, _ = parse_request(payload(smooth_columns()))
+        columns, _, _ = parse_request(payload(smooth_columns()))
         limits = {k: DEFAULT_LIMITS[k] for k in
                   ("min_thickness", "max_thickness",
                    "max_slope", "max_thickness_change")}
@@ -185,7 +223,7 @@ class ScenarioTests(unittest.TestCase):
     def test_stable_tie_break_by_candidate_id(self):
         # 每个上/下位置各有两个等深、等置信、不同编号候选，
         # 目标值完全相同，逐列编号字典序最小者稳定胜出。
-        columns, limits = parse_request(payload([
+        columns, limits, _ = parse_request(payload([
             col([("b", 5, 3), ("a", 5, 3), ("d", 12, 3), ("c", 12, 3)])
             for _ in range(8)
         ]))
@@ -211,7 +249,7 @@ class ScenarioTests(unittest.TestCase):
             "min_thickness": 6, "max_thickness": 10,
             "max_slope": 2, "max_thickness_change": 2, "max_second_diff": 2,
         }
-        columns, plimits = parse_request(payload(zigzag, limits))
+        columns, plimits, _ = parse_request(payload(zigzag, limits))
         result = solve(columns, plimits)
         validate_result(columns, plimits, result)
         self.assertEqual([p["id"] for p in result["upper_horizon"]], ["H"] * 8)
@@ -274,18 +312,21 @@ class ScenarioTests(unittest.TestCase):
             parse_request(float_depth)
 
 
-def brute_force(columns, limits):
+def brute_force(columns, limits, phase_cfg=None):
     """穷举所有联合状态序列，返回与求解器同口径的最优键。
 
     key = (-总置信度, 最大二阶差, 总行程, 状态序号元组)；None 表示无解。
+    phase_cfg 非 None 时，普通边界保相、声明边界反相才允许延续。
     """
     col_states = [_build_states(c, limits) for c in columns]
     if any(not s for s in col_states):
         return None
     n = len(columns)
+    flips = phase_cfg["flips"] if phase_cfg is not None else None
     best = None
 
-    def rec(ci, ranks, pdu, pdl, ppdu, ppdl, neg_conf, max_sec, travel):
+    def rec(ci, ranks, pdu, pdl, ppdu, ppdl, pup, plo,
+            neg_conf, max_sec, travel):
         nonlocal best
         if ci == n:
             key = (neg_conf, max_sec, travel, tuple(ranks))
@@ -302,6 +343,15 @@ def brute_force(columns, limits):
                     continue
                 if abs(thick - (pdl - pdu)) > limits["max_thickness_change"]:
                     continue
+                if flips is not None:
+                    must_flip = (ci - 1) in flips
+                    up_same = up["phase"] == pup["phase"]
+                    lo_same = lo["phase"] == plo["phase"]
+                    if must_flip:
+                        if up_same or lo_same:
+                            continue
+                    elif not up_same or not lo_same:
+                        continue
                 nmax, ntrav = max_sec, travel + us + ls
                 if ppdu is not None:
                     cap2 = limits.get("max_second_diff")
@@ -314,10 +364,10 @@ def brute_force(columns, limits):
             else:
                 nmax, ntrav = 0, 0
             rec(ci + 1, ranks + [rank], up["depth"], lo["depth"],
-                pdu, pdl,
+                pdu, pdl, up, lo,
                 neg_conf - up["confidence"] - lo["confidence"], nmax, ntrav)
 
-    rec(0, [], None, None, None, None, 0, 0, 0)
+    rec(0, [], None, None, None, None, None, None, 0, 0, 0)
     return best
 
 
@@ -337,12 +387,32 @@ def result_rank_path(columns, limits, result):
 def random_body(rng):
     n = rng.randint(MIN_COLS, 10)
     ids = ["a", "b", "c"]
+    with_phase = rng.random() < 0.5
+    # 先决定反转边界，再让候选 a/b 严格遵循由此产生的相位模式，
+    # 从而既有大量相位可行实例，又保留候选 c 的随机相位制造不可行。
+    n_flips = rng.randint(0, 2) if with_phase else 0
+    flip_set = set(rng.sample(range(n - 1), k=n_flips)) if n_flips else set()
+    pattern = []
+    sign = 1
+    for i in range(n):
+        if i > 0 and (i - 1) in flip_set:
+            sign *= -1
+        pattern.append("positive" if sign > 0 else "negative")
+
     columns = []
-    for _ in range(n):
+    for i in range(n):
         depths = rng.sample(range(0, 9), k=3)  # 同列深度互异
-        columns.append(col([
-            (ids[j], depths[j], rng.randint(1, 5)) for j in range(3)
-        ]))
+        if with_phase:
+            phases = [pattern[i], pattern[i],
+                      rng.choice(("positive", "negative"))]
+            columns.append(colp([
+                (ids[j], depths[j], rng.randint(1, 5), phases[j])
+                for j in range(3)
+            ]))
+        else:
+            columns.append(col([
+                (ids[j], depths[j], rng.randint(1, 5)) for j in range(3)
+            ]))
     limits = {
         "min_thickness": 1,
         "max_thickness": 9,
@@ -353,23 +423,238 @@ def random_body(rng):
     # 约一半实例省略二阶差硬上限（裁决仍最小化最大二阶差）。
     if rng.random() < 0.5:
         del limits["max_second_diff"]
-    return payload(columns, limits)
+    body = payload(columns, limits)
+    if with_phase:
+        body["phase_continuity"] = {
+            "polarity_flips": sorted(flip_set)
+        }
+    return body
+
+
+class PhaseScenarioTests(unittest.TestCase):
+    def test_high_confidence_phase_jump_is_pseudo_reflection(self):
+        # 高置信伪反射 P/Q 只出现在后 4 列且整体为负相：未声明反转时，
+        # 相位连续的低置信 G/g 必须胜出（几何上二者完全等价）。
+        n = 8
+        columns = []
+        for i in range(n):
+            cands = [
+                ("G", 10 + i, 5, "positive"),
+                ("g", 18 + i, 5, "positive"),
+                ("X", 0, 9, "positive"),
+                ("Y", 30, 9, "positive"),
+            ]
+            if i >= 4:
+                cands += [("P", 10 + i, 9, "negative"),
+                          ("Q", 18 + i, 9, "negative")]
+            columns.append(colp(cands))
+        body = phase_body(columns, flips=[], limits=DEFAULT_LIMITS)
+        cols, lim, cfg = parse_request(body)
+        result = trace(body)
+        validate_result(cols, lim, result, cfg)
+        self.assertEqual([p["id"] for p in result["upper_horizon"]], ["G"] * n)
+        self.assertEqual([p["id"] for p in result["lower_horizon"]], ["g"] * n)
+        self.assertEqual(result["verdict"]["total_confidence"], 80)
+        self.assertEqual(result["polarity_flips"], [])
+        self.assertEqual(
+            [p["phase"] for p in result["phases"]["upper"]], ["positive"] * n
+        )
+
+    def test_declared_flip_selects_high_confidence_track(self):
+        # 同样的 P/Q 负相轨迹，在声明边界 3 反转后合法并以高置信胜出：
+        # 前 4 列走 G/g，后 4 列走 P/Q，实际反转边界恰为 [3]。
+        n = 8
+        columns = []
+        for i in range(n):
+            cands = [
+                ("G", 10 + i, 5, "positive"),
+                ("g", 18 + i, 5, "positive"),
+                ("X", 0, 9, "positive"),
+                ("Y", 30, 9, "positive"),
+            ]
+            if i >= 4:
+                cands += [("P", 10 + i, 9, "negative"),
+                          ("Q", 18 + i, 9, "negative")]
+            columns.append(colp(cands))
+        body = phase_body(columns, flips=[3], limits=DEFAULT_LIMITS)
+        cols, lim, cfg = parse_request(body)
+        result = trace(body)
+        validate_result(cols, lim, result, cfg)
+        self.assertEqual(
+            [p["id"] for p in result["upper_horizon"]], ["G"] * 4 + ["P"] * 4
+        )
+        self.assertEqual(
+            [p["id"] for p in result["lower_horizon"]], ["g"] * 4 + ["Q"] * 4
+        )
+        self.assertEqual(result["verdict"]["total_confidence"], 40 + 72)
+        self.assertEqual(result["polarity_flips"], [3])
+        self.assertEqual(
+            [p["phase"] for p in result["phases"]["upper"]],
+            ["positive"] * 4 + ["negative"] * 4,
+        )
+
+    def test_phase_rules_render_no_solution_without_traces(self):
+        # 平滑双界面 U/L 是唯一几何可行状态，但其相位在边界 3 反转；
+        # 不声明反转 -> 相位规则使联合轨迹不可行，返回原无解结构。
+        columns = []
+        for i in range(8):
+            ph = "negative" if i >= 4 else "positive"
+            columns.append(colp([
+                ("U", 10 + i, 5, ph), ("L", 18 + i, 5, ph),
+                ("X", 0, 9, "positive"), ("Y", 30, 9, "positive"),
+            ]))
+        body = phase_body(columns, flips=[], limits=DEFAULT_LIMITS)
+        result = trace(body)
+        self.assertFalse(result["feasible"])
+        self.assertEqual(result["status"], "no_solution")
+        self.assertNotIn("upper_horizon", result)
+        self.assertNotIn("lower_horizon", result)
+        self.assertNotIn("phases", result)
+        self.assertNotIn("polarity_flips", result)
+
+        # 声明该边界后恢复可行，且实际反转边界回传。
+        body["phase_continuity"]["polarity_flips"] = [3]
+        cols, lim, cfg = parse_request(body)
+        ok = trace(body)
+        validate_result(cols, lim, ok, cfg)
+        self.assertEqual(ok["polarity_flips"], [3])
+
+    def test_two_declared_flips(self):
+        # 两条反转边界：相位模式 + - +，两条界面同步换相两次。
+        n = 8
+        columns = []
+        for i in range(n):
+            sign = 1
+            for f in (2, 5):
+                if i > f:
+                    sign *= -1
+            ph = "positive" if sign > 0 else "negative"
+            columns.append(colp([
+                ("U", 10 + i, 5, ph), ("L", 18 + i, 5, ph),
+                ("X", 0, 9, "positive"), ("Y", 30, 9, "positive"),
+            ]))
+        body = phase_body(columns, flips=[2, 5], limits=DEFAULT_LIMITS)
+        cols, lim, cfg = parse_request(body)
+        result = trace(body)
+        validate_result(cols, lim, result, cfg)
+        self.assertEqual([p["id"] for p in result["upper_horizon"]], ["U"] * n)
+        self.assertEqual(result["polarity_flips"], [2, 5])
+        self.assertEqual(
+            [p["phase"] for p in result["phases"]["upper"]],
+            ["positive"] * 3 + ["negative"] * 3 + ["positive"] * 2,
+        )
+
+    def test_disabled_request_ignores_phase_fields(self):
+        # 不带 phase_continuity：候选即便带 phase 也被忽略，
+        # 响应不含相位字段，结果与旧口径一致。
+        columns = []
+        for i in range(8):
+            columns.append(colp([
+                ("U", 10 + i, 5, "positive"), ("L", 18 + i, 5, "negative"),
+                ("X", 0, 9, "positive"), ("Y", 30, 9, "negative"),
+            ]))
+        plain = payload(columns)
+        cols, lim, cfg = parse_request(plain)
+        self.assertIsNone(cfg)
+        result = trace(plain)
+        validate_result(cols, lim, result)
+        self.assertNotIn("phases", result)
+        self.assertNotIn("polarity_flips", result)
+        self.assertEqual(result["verdict"]["total_confidence"], 80)
+
+    def test_enabled_without_flips_matches_plain_on_consistent_phase(self):
+        columns = [
+            colp([("U", 10 + i, 5, "positive"), ("L", 18 + i, 5, "positive"),
+                  ("X", 0, 9, "positive"), ("Y", 30, 9, "positive")])
+            for i in range(8)
+        ]
+        plain = trace(payload(columns))
+        body = phase_body(columns, flips=[])
+        enabled = trace(body)
+        for key in ("upper_horizon", "lower_horizon", "thicknesses",
+                    "slopes", "second_diffs", "verdict"):
+            self.assertEqual(plain[key], enabled[key])
+
+    def test_phase_validation_errors(self):
+        import copy
+
+        def enabled(cols, flips=None):
+            # 各子用例会就地改写字段，这里深拷贝避免互相污染。
+            return phase_body(copy.deepcopy(cols),
+                              flips if flips is not None else [])
+
+        base = [
+            colp([("U", 10 + i, 5, "positive"), ("L", 18 + i, 5, "positive"),
+                  ("X", 0, 9, "positive"), ("Y", 30, 9, "positive")])
+            for i in range(8)
+        ]
+
+        # 启用后候选缺失 phase。
+        missing = enabled(base)
+        del missing["columns"][0]["candidates"][0]["phase"]
+        with self.assertRaises(ValidationError):
+            parse_request(missing)
+
+        # 非法相位取值。
+        bad_phase = enabled(base)
+        bad_phase["columns"][1]["candidates"][0]["phase"] = "POSITIVE"
+        with self.assertRaises(ValidationError):
+            parse_request(bad_phase)
+        bad_phase["columns"][1]["candidates"][0]["phase"] = None
+        with self.assertRaises(ValidationError):
+            parse_request(bad_phase)
+
+        # phase_continuity 不是对象。
+        null_cfg = payload(base)
+        null_cfg["phase_continuity"] = None
+        with self.assertRaises(ValidationError):
+            parse_request(null_cfg)
+
+        # polarity_flips 不是数组。
+        bad_list = enabled(base, flips=[1])
+        bad_list["phase_continuity"]["polarity_flips"] = 3
+        with self.assertRaises(ValidationError):
+            parse_request(bad_list)
+
+        # 越界边界（8 列合法边界 0~6）。
+        with self.assertRaises(ValidationError):
+            parse_request(enabled(base, flips=[7]))
+        with self.assertRaises(ValidationError):
+            parse_request(enabled(base, flips=[-1]))
+
+        # 非整数与布尔值。
+        with self.assertRaises(ValidationError):
+            parse_request(enabled(base, flips=[2.0]))
+        with self.assertRaises(ValidationError):
+            parse_request(enabled(base, flips=[True]))
+
+        # 重复边界。
+        with self.assertRaises(ValidationError):
+            parse_request(enabled(base, flips=[3, 3]))
+
+        # 超过两个。
+        with self.assertRaises(ValidationError):
+            parse_request(enabled(base, flips=[1, 2, 3]))
+
+        # 边界 0、6 是合法值，应通过校验。
+        parse_request(enabled(base, flips=[0, 6]))
 
 
 class FuzzTests(unittest.TestCase):
     def test_matches_brute_force(self):
         rng = random.Random(20261001)
         feasible_hits = 0
-        for _ in range(300):
+        phase_hits = 0
+        for _ in range(400):
             body = random_body(rng)
-            columns, limits = parse_request(body)
-            expected = brute_force(columns, limits)
-            actual = solve(columns, limits)
+            columns, limits, phase_cfg = parse_request(body)
+            expected = brute_force(columns, limits, phase_cfg)
+            actual = solve(columns, limits, phase_cfg)
             if expected is None:
                 self.assertFalse(actual["feasible"])
                 continue
             self.assertTrue(actual["feasible"])
-            validate_result(columns, limits, actual)
+            validate_result(columns, limits, actual, phase_cfg)
             key = (
                 -actual["verdict"]["total_confidence"],
                 actual["verdict"]["max_second_diff"],
@@ -378,14 +663,18 @@ class FuzzTests(unittest.TestCase):
             )
             self.assertEqual(key, expected)
             feasible_hits += 1
-        self.assertGreater(feasible_hits, 50)
+            if phase_cfg is not None:
+                phase_hits += 1
+        self.assertGreater(feasible_hits, 60)
+        # 必须有足量启用相位的可行实例，相位输出才真正被对照过。
+        self.assertGreater(phase_hits, 30)
 
 
 class PerformanceTests(unittest.TestCase):
     def test_max_size_runs_fast(self):
         rng = random.Random(42)
         ids = [f"p{j}" for j in range(MAX_CANDIDATES)]
-        columns, limits = parse_request(payload([
+        columns, limits, _ = parse_request(payload([
             col([(ids[j], rng.randint(0, 40), rng.randint(1, 9))
                  for j in range(MAX_CANDIDATES)])
             for _ in range(MAX_COLS)

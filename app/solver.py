@@ -6,6 +6,11 @@
 (上候选, 下候选) 有序对，转移时一次性检查两条界面的全部约束，
 因此不会出现"先追一条界面、再为另一条补点"的伪轨迹。
 
+启用 phase_continuity 后，每个候选带 positive/negative 相位：
+普通相邻边界两侧两条界面须分别保持相位，声明的极性反转边界
+（polarity_flips，整数 i 表示第 i 与 i+1 列之间）两侧须分别
+反转相位。该约束同样在联合状态转移时一次性校验。
+
 最优性按词典序：
   1. 置信度总和最大
   2. 两条界面最大二阶差最小
@@ -21,6 +26,10 @@ MAX_COLS = 24
 MIN_CANDIDATES = 3
 MAX_CANDIDATES = 8
 
+# 相位连续性开启时，每条剖面最多声明两个互异反转边界。
+MAX_POLARITY_FLIPS = 2
+PHASES = ("positive", "negative")
+
 
 class ValidationError(ValueError):
     """请求数据不满足接口契约。"""
@@ -32,7 +41,7 @@ def _as_int(value, name):
     return value
 
 
-def _parse_column(raw, index):
+def _parse_column(raw, index, with_phase=False):
     """解析并校验单列数据，返回按深度排序的候选列表。"""
     if not isinstance(raw, dict):
         raise ValidationError(f"columns[{index}] 必须是对象")
@@ -69,12 +78,57 @@ def _parse_column(raw, index):
             raise ValidationError(
                 f"columns[{index}].candidates[{j}].confidence 必须是正整数"
             )
-        cands.append({"id": cid, "depth": depth, "confidence": conf})
+        phase = None
+        if with_phase:
+            # 启用相位连续性时，每个候选必须显式给出合法相位。
+            phase = item.get("phase")
+            if phase not in PHASES:
+                raise ValidationError(
+                    f"columns[{index}].candidates[{j}].phase "
+                    f"必须是 {' 或 '.join(PHASES)}"
+                )
+        cands.append(
+            {"id": cid, "depth": depth, "confidence": conf, "phase": phase}
+        )
 
     # 深度相同的候选不影响正确性（它们之间无法配成严格分离对），
     # 排序仅用于输出稳定与编号决胜。
     cands.sort(key=lambda c: (c["depth"], c["id"]))
     return cands
+
+
+def _parse_phase_continuity(payload, n_cols):
+    """校验 phase_continuity 配置。
+
+    返回 None（未启用，键不存在）或 {"flips": frozenset(边界列号)}。
+    边界 i 表示第 i 与第 i+1 列之间，故取值域为 0..n_cols-2；
+    至多声明两个互异边界，越界或重复均拒绝。
+    """
+    if "phase_continuity" not in payload:
+        return None
+    raw = payload["phase_continuity"]
+    if not isinstance(raw, dict):
+        raise ValidationError("phase_continuity 必须是对象")
+    flips_raw = raw.get("polarity_flips", [])
+    if not isinstance(flips_raw, list):
+        raise ValidationError("phase_continuity.polarity_flips 必须是数组")
+    if len(flips_raw) > MAX_POLARITY_FLIPS:
+        raise ValidationError(
+            f"polarity_flips 至多声明 {MAX_POLARITY_FLIPS} 个反转边界"
+        )
+    flips = set()
+    for k, value in enumerate(flips_raw):
+        i = _as_int(value, f"phase_continuity.polarity_flips[{k}]")
+        if not (0 <= i <= n_cols - 2):
+            raise ValidationError(
+                f"phase_continuity.polarity_flips[{k}]={i} 越界："
+                f"边界列号必须在 0~{n_cols - 2} 之间"
+            )
+        if i in flips:
+            raise ValidationError(f"polarity_flips 存在重复边界: {i}")
+        flips.add(i)
+    # 未知字段不影响语义，按宽容策略放行。
+    return {"flips": frozenset(flips)}
 
 
 def _parse_limits(payload):
@@ -126,7 +180,10 @@ def _parse_limits(payload):
 
 
 def parse_request(payload):
-    """校验请求体，返回 (columns, limits)。"""
+    """校验请求体，返回 (columns, limits, phase_cfg)。
+
+    phase_cfg 为 None 表示未启用 phase_continuity（旧请求口径）。
+    """
     if not isinstance(payload, dict):
         raise ValidationError("请求体必须是 JSON 对象")
     cols_raw = payload.get("columns")
@@ -135,9 +192,11 @@ def parse_request(payload):
     if not (MIN_COLS <= len(cols_raw) <= MAX_COLS):
         raise ValidationError(f"columns 数量必须在 {MIN_COLS}~{MAX_COLS} 之间")
 
-    columns = [_parse_column(col, i) for i, col in enumerate(cols_raw)]
+    phase_cfg = _parse_phase_continuity(payload, len(cols_raw))
+    with_phase = phase_cfg is not None
+    columns = [_parse_column(col, i, with_phase) for i, col in enumerate(cols_raw)]
     limits = _parse_limits(payload.get("limits"))
-    return columns, limits
+    return columns, limits, phase_cfg
 
 
 def _build_states(column, limits):
@@ -169,11 +228,15 @@ def _better(candidate, current):
     return cpath < bpath
 
 
-def _run_dp(columns, col_states, limits, cap, collect_costs=False):
+def _run_dp(columns, col_states, limits, cap, phase_cfg=None,
+            collect_costs=False):
     """在"每条连续三列的二阶差 <= cap"硬约束下做分层状态 DP。
 
     固定 cap 后只剩置信度（最大化）与行程（最小化）两个可加目标，
     每个 (上一列状态, 当前列状态) 只保留唯一词典序最优前缀。
+
+    phase_cfg 非 None 时，相邻列转移额外校验两条界面的相位：
+    普通边界两侧各自保持相位，声明的反转边界两侧各自反转相位。
 
     collect_costs=True 时顺带收集全部局部可行三元组产生的二阶差值
     （用于二分全局最优 cap 的候选集合）。
@@ -226,6 +289,18 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
                 if abs(thickness - pthick) > limits["max_thickness_change"]:
                     continue
 
+                if phase_cfg is not None:
+                    # 边界 (ci-1, ci)：声明为反转边界时两条界面各自
+                    # 换相，否则各自保相。上/下两条界面独立校验。
+                    must_flip = (ci - 1) in phase_cfg["flips"]
+                    up_same = up["phase"] == pup["phase"]
+                    lo_same = lo["phase"] == plo["phase"]
+                    if must_flip:
+                        if up_same or lo_same:
+                            continue
+                    elif not up_same or not lo_same:
+                        continue
+
                 records = predecessors_of(pr)
                 if ci >= 2 and collect_costs:
                     for ppui0, ppli0 in col_states[ci - 2]:
@@ -270,7 +345,7 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
     return best is not None, best, costs
 
 
-def solve(columns, limits):
+def solve(columns, limits, phase_cfg=None):
     """联合追踪求解。
 
     策略（严格按裁决词典序）：
@@ -279,6 +354,9 @@ def solve(columns, limits):
       2. 对候选二阶差值二分：求最小的 K，使"在硬约束 K 下仍能达到
          置信度 C*"（可达置信度对 K 单调）；
       3. 在 K 下做最终（置信度, 行程, 编号路径）词典序 DP。
+
+    phase_cfg 非 None 时，相位连续性与几何约束在同一次联合 DP 中
+    一起裁决；相位规则导致的不可行与几何不可行同口径返回无解。
     """
     col_states = [_build_states(col, limits) for col in columns]
     if any(not states for states in col_states):
@@ -286,7 +364,8 @@ def solve(columns, limits):
 
     cap_limit = limits.get("max_second_diff")
     feasible, best_l, costs = _run_dp(
-        columns, col_states, limits, cap_limit, collect_costs=True
+        columns, col_states, limits, cap_limit, phase_cfg,
+        collect_costs=True
     )
     if not feasible:
         return {"feasible": False}
@@ -296,7 +375,7 @@ def solve(columns, limits):
     candidates = sorted(costs | {0})
 
     def reaches_max_confidence(cap):
-        ok, best, _ = _run_dp(columns, col_states, limits, cap)
+        ok, best, _ = _run_dp(columns, col_states, limits, cap, phase_cfg)
         return ok and -best[0][0] == max_confidence
 
     lo_i, hi_i = 0, len(candidates) - 1
@@ -308,18 +387,20 @@ def solve(columns, limits):
             lo_i = mid + 1
     optimal_cap = candidates[lo_i]
 
-    _, best, _ = _run_dp(columns, col_states, limits, optimal_cap)
+    _, best, _ = _run_dp(columns, col_states, limits, optimal_cap, phase_cfg)
     (neg_conf, total_travel), ranks = best
     path = [col_states[ci][rank] for ci, rank in enumerate(ranks)]
     return _build_result(
-        columns, path, -neg_conf, optimal_cap, total_travel
+        columns, path, -neg_conf, optimal_cap, total_travel, phase_cfg
     )
 
 
-def _build_result(columns, path, total_conf, max_second_diff, total_travel):
+def _build_result(columns, path, total_conf, max_second_diff, total_travel,
+                  phase_cfg=None):
     upper, lower, thicknesses = [], [], []
     u_slopes, l_slopes = [], []
     u_seconds, l_seconds = [], []
+    u_phases, l_phases = [], []
 
     for ci, (ui, li) in enumerate(path):
         up, lo = columns[ci][ui], columns[ci][li]
@@ -328,6 +409,9 @@ def _build_result(columns, path, total_conf, max_second_diff, total_travel):
         thicknesses.append(
             {"column": ci, "thickness": lo["depth"] - up["depth"]}
         )
+        if phase_cfg is not None:
+            u_phases.append({"column": ci, "phase": up["phase"]})
+            l_phases.append({"column": ci, "phase": lo["phase"]})
         if ci >= 1:
             pu = columns[ci - 1][path[ci - 1][0]]["depth"]
             pl = columns[ci - 1][path[ci - 1][1]]["depth"]
@@ -349,7 +433,7 @@ def _build_result(columns, path, total_conf, max_second_diff, total_travel):
                 {"columns": [ci - 2, ci - 1, ci], "second_diff": lo["depth"] - 2 * pl + ppl}
             )
 
-    return {
+    result = {
         "feasible": True,
         "upper_horizon": upper,
         "lower_horizon": lower,
@@ -362,12 +446,24 @@ def _build_result(columns, path, total_conf, max_second_diff, total_travel):
             "total_travel": total_travel,
         },
     }
+    if phase_cfg is not None:
+        # 实际反转边界：选中轨迹上相位发生切换的列间边界。
+        # 由转移约束，它恰好等于声明且被轨迹跨越的 polarity_flips。
+        actual_flips = [
+            ci - 1
+            for ci in range(1, len(path))
+            if columns[ci][path[ci][0]]["phase"]
+            != columns[ci - 1][path[ci - 1][0]]["phase"]
+        ]
+        result["phases"] = {"upper": u_phases, "lower": l_phases}
+        result["polarity_flips"] = actual_flips
+    return result
 
 
 def trace(payload):
     """供 HTTP 层调用的入口：校验 -> 求解。"""
-    columns, limits = parse_request(payload)
-    result = solve(columns, limits)
+    columns, limits, phase_cfg = parse_request(payload)
+    result = solve(columns, limits, phase_cfg)
     if not result["feasible"]:
         result["status"] = "no_solution"
         result["message"] = "不存在满足全部约束的上下界面联合拾取组合"

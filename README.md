@@ -61,6 +61,44 @@ API_PORT=9000 docker compose up app
   必填；`max_second_diff` 可选——缺省时不加二阶差硬约束，但最大二阶差
   仍作为第二裁决目标被最小化。
 
+### 相位连续性（可选）
+
+请求体可携带 `phase_continuity` 启用相位约束。启用后每个候选**必须**
+给出 `phase`（`"positive"` 或 `"negative"`），并可用 `polarity_flips`
+声明**至多两个互异**的极性反转边界——整数 `i` 表示第 `i` 与第 `i+1`
+列之间（8 列时合法取值为 `0`~`6`）。越界值、重复边界、非整数或缺失
+相位均按字段拒绝（HTTP 422）。
+
+```json
+{
+  "columns": [
+    {"candidates": [
+      {"id": "U", "depth": 10, "confidence": 5, "phase": "positive"},
+      {"id": "L", "depth": 18, "confidence": 5, "phase": "positive"},
+      {"id": "X", "depth": 0,  "confidence": 9, "phase": "negative"}
+    ]}
+  ],
+  "limits": {"min_thickness": 6, "max_thickness": 10,
+             "max_slope": 1, "max_thickness_change": 1},
+  "phase_continuity": {"polarity_flips": [3]}
+}
+```
+
+规则：普通边界两侧，上/下两条界面分别**保持**相位；声明的反转边界
+两侧分别**反转**相位。该约束与几何约束在同一次联合 DP 中裁决，
+因此高置信但相位跳变的伪反射不会被选中。几何约束可满足、但相位
+规则使联合轨迹不可行时，仍返回原无解结构，且不泄露任何局部轨迹。
+
+启用后的成功响应在原有字段外额外返回：
+
+| 字段 | 含义 |
+| --- | --- |
+| `phases.upper/lower` | 两条界面的逐列相位（`column` + `phase`） |
+| `polarity_flips` | 选中轨迹上实际发生反转的列间边界（升序整数数组） |
+
+未携带 `phase_continuity` 的请求，输入、响应、裁决与无解语义与
+启用前完全一致（候选中即使出现 `phase` 字段也会被忽略）。
+
 成功响应（HTTP 200）包含：
 
 | 字段 | 含义 |
